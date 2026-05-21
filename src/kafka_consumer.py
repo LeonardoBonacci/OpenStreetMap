@@ -88,14 +88,14 @@ def write_to_neo4j(session, msg: dict):
         vehicle_count=msg["vehicle_count"],
         avg_speed_kph=msg["avg_speed_kph"],
         ts=msg["ts"],
-    )
+    ).consume()
     session.run(
         _SNAPSHOT_CYPHER,
         osmid=msg["intersection_osmid"],
         vehicle_count=msg["vehicle_count"],
         avg_speed_kph=msg["avg_speed_kph"],
         ts=msg["ts"],
-    )
+    ).consume()
 
 
 def lookup_street(session, osmid: int) -> str | None:
