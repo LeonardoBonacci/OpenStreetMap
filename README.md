@@ -134,11 +134,21 @@ Natural language interface over the static road graph. A user asks a plain-Engli
 - *"Which named street has the longest total length?"* → groups by `r.name`, sums `r.length`
 - *"How many dead-end intersections are there?"* → filters `i.street_count = 1`
 
-**Stack:** `langchain-neo4j` (`Neo4jGraph` + `GraphCypherQAChain`), `langchain-openai`
+**Stack:** `langchain-neo4j` (`Neo4jGraph` + `GraphCypherQAChain`), `langchain-ollama` (`ChatOllama`)
 
 `Neo4jGraph` auto-introspects the schema — no manual description needed. `verbose=True` prints generated Cypher alongside the answer for easy validation.
 
-**New `.env` key:** `OPENAI_API_KEY`
+**Run:**
+```bash
+python src/text2cypher.py          # 5 demo questions
+python src/text2cypher.py --repl   # interactive prompt
+```
+
+**Optional `.env` overrides:**
+```
+OLLAMA_MODEL=llama3.1:latest
+OLLAMA_BASE_URL=http://localhost:11434
+```
 
 ---
 
