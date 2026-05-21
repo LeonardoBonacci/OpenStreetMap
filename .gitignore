@@ -221,5 +221,8 @@ __marimo__/
 data/databases/
 data/dbms/
 data/transactions/
+data/cluster-state/
 data/download.log
 logs/
+cache/
+influxdb-data/
