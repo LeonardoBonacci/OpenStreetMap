@@ -8,7 +8,7 @@ sleep 1
 cd "$(dirname "$0")"
 
 # Neo4j consumer (graph state + snapshots + alerts)
-nohup python3 src/neo4j/kafka_consumer.py >> /tmp/consumer.log 2>&1 &
+nohup python3 src/graph/kafka_consumer.py >> /tmp/consumer.log 2>&1 &
 echo "Neo4j Consumer PID: $!"
 
 # InfluxDB consumer (time-series writes)
