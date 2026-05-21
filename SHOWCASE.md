@@ -15,6 +15,7 @@ The project stitches together five concerns that any real urban-intelligence pla
 | **Live state maintenance** | Kafka consumer + Neo4j | Graph nodes are mutated in place as events arrive |
 | **Contextual knowledge** | Advisory nodes + vector index | Human-authored disruption notices linked to the graph by topology |
 | **Natural language interface** | Ollama (llama3.1) + LangChain | Both Text→Cypher analytics and GraphRAG route Q&A |
+| **Structural analytics** | Neo4j GDS (Betweenness, PageRank) | Identifies critical bottleneck intersections in the network |
 
 None of these is novel in isolation. The novelty is their **composition**: every query can simultaneously touch static geometry, live traffic state, and semantic advisory text, all within the same graph traversal.
 
@@ -64,12 +65,13 @@ load_advisories.py         ← Phase 6    kafka_producer.py   ← Phase 7
            │  :Advisory (+ 768-dim embedding vector)    │
            └───────────────────────────────────────────┘
                     │
-          ┌─────────┴──────────┐
-          ▼                    ▼
-  text2cypher.py        graphrag_retriever.py
-  Phase 5               Phase 6
-  NL → Cypher           Dijkstra route → advisory retrieval → LLM
-  via llama3.1          route-aware answers via llama3.1
+          ┌─────────┼──────────────────────┐
+          ▼         ▼                      ▼
+  text2cypher.py  graphrag_retriever.py  gds_analytics.py
+  Phase 5         Phase 6               Phase 8
+  NL → Cypher     Dijkstra route →      Betweenness Centrality
+  via llama3.1    advisory retrieval     + PageRank → criticality
+                  → LLM                  scores on :Intersection
 ```
 
 ---
@@ -174,6 +176,40 @@ python src/graphrag_retriever.py --repl
 **Consumer** — processes the stream in real time:
 - Writes `current_speed`, `current_flow`, `last_seen` directly onto each `:Intersection` node
 - If `avg_speed_kph < 15`, publishes a congestion alert to `traffic-alerts` topic
+
+### Phase 8 — GDS Graph Analytics (`src/gds_analytics.py`)
+
+Runs Neo4j Graph Data Science algorithms to score every intersection by structural importance:
+
+- **Betweenness Centrality** → `criticality` property — how many shortest paths pass through this node. High-criticality intersections are network bottlenecks: if they fail, many routes are disrupted.
+- **PageRank** → `pagerank` property — importance from a flow/connectivity perspective. Intersections fed by many well-connected roads rank highest.
+
+Both scores are written directly onto `:Intersection` nodes, enabling combined structural + live-traffic queries.
+
+Run it:
+```bash
+python src/gds_analytics.py           # compute & print top-10 summary
+python src/gds_analytics.py --query   # also run insight queries
+```
+
+Key insight queries this enables:
+```cypher
+-- Critical bottlenecks that are CURRENTLY congested
+MATCH (i:Intersection)
+WHERE i.current_speed < 15 AND i.criticality > 0.01
+RETURN i.osmid, i.criticality, i.pagerank, i.current_speed
+ORDER BY i.criticality DESC
+```
+
+```cypher
+-- Advisories hitting structurally important intersections
+MATCH (a:Advisory)-[:AFFECTS_ROAD]->(i:Intersection)
+WHERE i.criticality > 0.01
+RETURN a.title, count(i) AS critical_nodes, round(avg(i.criticality), 4) AS avg_crit
+ORDER BY avg_crit DESC
+```
+
+This turns the graph from a passive topology store into an **active risk model**: you can now prioritise alerts and maintenance based on structural importance, not just current congestion.
 
 ---
 
@@ -284,7 +320,7 @@ A city council, research lab, or startup can stand this up in an afternoon and i
 | Real sensor feeds | Replace the Kafka producer with an MQTT bridge or HTTP webhook |
 | More city districts | Change the bounding box in `download_network.py` |
 | Incident detection | Add a second consumer that writes `:Incident` nodes when thresholds are exceeded |
-| Route optimisation | Add GDS betweenness centrality to identify critical intersections |
+| Route optimisation | ✅ Done — `gds_analytics.py` writes `criticality` + `pagerank` to every intersection |
 | Public alerts API | Expose the `traffic-alerts` Kafka topic via a WebSocket endpoint |
 | Historical replay | Persist consumer events to a time-series node `(:Reading {ts, speed, flow})-[:AT]->(:Intersection)` |
 | Multi-modal transport | Add `:BusRoute`, `:TrainLine` nodes linked to `:Intersection` by proximity |
