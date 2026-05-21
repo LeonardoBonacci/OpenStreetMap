@@ -375,3 +375,11 @@ A city council, research lab, or startup can stand this up in an afternoon and i
 | Public alerts API | Expose the `traffic-alerts` Kafka topic via a WebSocket endpoint |
 | Historical replay | \u2705 Done — `kafka_consumer.py` writes `:TrafficSnapshot` nodes with native `datetime`; `traffic_history.py` analyses patterns |
 | Multi-modal transport | Add `:BusRoute`, `:TrainLine` nodes linked to `:Intersection` by proximity |
+
+---
+
+## References
+
+- [Neo4j Graph Data Science](https://neo4j.com/product/graph-data-science/) — GDS library used for Betweenness Centrality and PageRank analytics
+- [Text2Cypher Guide](https://neo4j.com/blog/genai/text2cypher-guide/) — Natural-language to Cypher query generation patterns
+- [GraphRAG with Python](https://neo4j.com/developer/genai-ecosystem/graphrag-python/) — Graph-augmented retrieval-augmented generation with Neo4j and LangChain
