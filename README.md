@@ -8,6 +8,7 @@ A progressive experiment building a smart-city graph pipeline on top of the Well
 | **5** | Natural language analytics | LangChain · `GraphCypherQAChain` |
 | **6** | Route-aware document Q&A | GraphRAG · Neo4j Vector |
 | **7** | Live traffic simulation | Kafka · stream processor |
+| **11** | Time-series storage + AI queries | InfluxDB 3 Core · MCP Server · Grafana |
 
 Each phase builds on the same Neo4j instance and the same `docker-compose.yml`.
 
@@ -286,6 +287,100 @@ PRODUCER_DELAY=0.5
 
 ---
 
+## Phase 11 — InfluxDB 3 + MCP Server — *depends on Phase 7*
+
+Adds a time-series layer alongside the Neo4j graph. Every Kafka message is now written to **InfluxDB 3 Core** as a typed time-series point. The **InfluxDB MCP Server** then exposes the database to any MCP-capable LLM client (VS Code Copilot, Claude Desktop) so it can answer natural-language traffic questions by generating and executing SQL.
+
+**New Kafka → InfluxDB consumer (`src/influxdb/influx_consumer.py`):**
+
+| Topic | Measurement | Tags | Fields |
+|---|---|---|---|
+| `sensor-readings` | `traffic_sensor` | `intersection_osmid` | `vehicle_count`, `avg_speed_kph` |
+| `approach-sensors` | `approach_sensor` | `from_osmid`, `to_osmid` | `queue_length`, `arrival_rate`, `occupancy_pct` |
+
+Points are accumulated in-memory and flushed to InfluxDB in batches of up to 100, or at most every 1 second — whichever comes first. A background thread guarantees the time-based flush even when the Kafka stream is slow.
+
+**Docker service** (`docker-compose.yml`):
+```yaml
+  influxdb3:
+    image: quay.io/influxdb/influxdb3-core:latest
+    container_name: influxdb3-traffic
+    ports:
+      - "8181:8181"
+    volumes:
+      - ./influxdb-data:/var/lib/influxdb3
+    command: ["serve", "--node-id", "local01", "--object-store", "file",
+              "--data-dir", "/var/lib/influxdb3", "--without-auth"]
+```
+
+**MCP Server (`influxdb-mcp/mcp.json` and `.vscode/mcp.json`):**
+```json
+{
+  "mcpServers": {
+    "influxdb": {
+      "command": "npx",
+      "args": ["-y", "@influxdata/influxdb3-mcp-server"],
+      "env": {
+        "INFLUX_DB_INSTANCE_URL": "http://localhost:8181/",
+        "INFLUX_DB_TOKEN": "local-dev-no-auth",
+        "INFLUX_DB_PRODUCT_TYPE": "core",
+        "INFLUX_DB_DATABASE": "traffic"
+      }
+    }
+  }
+}
+```
+
+The MCP server is invoked via `npx` — no Docker build required. VS Code Copilot picks it up automatically from `.vscode/mcp.json`.
+
+**Database context (`src/influxdb/context/database-context.md`):**
+
+A plain-Markdown schema document placed alongside the consumer. The MCP server uses it to give the LLM accurate column names, tag cardinalities, and example SQL queries — reducing hallucinated column names to near-zero.
+
+**Example questions Copilot can now answer:**
+- *"What's the busiest intersection right now?"*
+- *"Show me intersections with average speed below 15 km/h in the last hour"*
+- *"Which road approach has the highest queue length today?"*
+- *"Plot vehicle counts over the last 30 minutes for a specific intersection"*
+
+**Grafana dashboard** (`grafana/provisioning/`):
+
+The `InfluxDB3-Traffic` datasource is pre-provisioned and pointed at `http://influxdb3:8181`. Panels use the Infinity datasource plugin to execute SQL queries directly against InfluxDB 3.
+
+**Pipeline launcher (`start_pipeline.sh`):**
+```bash
+# Start all three processes together
+bash start_pipeline.sh
+```
+Launches the Neo4j consumer, InfluxDB consumer, and Kafka producer as background processes with log files under `/tmp/`.
+
+**Run individually:**
+```bash
+# Start InfluxDB (and all other services)
+docker compose up -d
+
+# Stream sensor readings into InfluxDB
+bash start_pipeline.sh
+
+# Or run the InfluxDB consumer standalone
+python src/influxdb/influx_consumer.py          # runs until Ctrl-C
+python src/influxdb/influx_consumer.py --once   # exits after both topics are idle for 5 s
+```
+
+**Activate the MCP Server in VS Code:**
+1. Open the Command Palette → **MCP: List Servers** (or restart VS Code)
+2. Copilot picks up `.vscode/mcp.json` automatically
+3. Ask Copilot: *"What's the busiest intersection right now?"*
+
+**Optional `.env` overrides:**
+```
+KAFKA_BOOTSTRAP=localhost:9092
+INFLUX_DB_INSTANCE_URL=http://localhost:8181
+INFLUX_DB_DATABASE=traffic
+```
+
+---
+
 ## Project Structure (end state)
 
 ```
@@ -302,8 +397,19 @@ PRODUCER_DELAY=0.5
     ├── text2cypher.py            # Phase 5: LangChain GraphCypherQAChain
     ├── load_advisories.py        # Phase 6: insert synthetic advisory docs
     ├── graphrag_retriever.py     # Phase 6: path-aware retrieval chain
-    ├── kafka_producer.py         # Phase 7: simulated sensor readings
-    └── kafka_consumer.py         # Phase 7: graph updates + alert emission
+    ├── kafka_producer.py         # Shared: sensor-readings + approach-sensors topics
+    ├── graph/
+    │   └── kafka_consumer.py     # Phase 7: Neo4j graph updates + alert emission
+    └── influxdb/
+        ├── __init__.py
+        ├── influx_consumer.py    # Phase 11: Kafka → InfluxDB 3 time-series sink
+        └── context/
+            └── database-context.md  # Phase 11: schema doc for MCP / LLM context
+├── influxdb-mcp/
+│   └── mcp.json                  # Phase 11: standalone MCP server config
+├── grafana/
+│   └── provisioning/             # Phase 11: pre-provisioned InfluxDB3-Traffic datasource
+└── start_pipeline.sh             # Phase 11: launches all three background processes
 ```
 
 ---
@@ -325,9 +431,16 @@ PRODUCER_DELAY=0.5
 
 **Phase 7**
 8. `docker compose up -d` → both `neo4j-road-net` and `kafka-traffic` containers running
-9. Start consumer (`python src/kafka_consumer.py`), then producer (`--count 50`) — consumer prints `[OK]` and `[ALERT]` lines
+9. Start consumer (`python src/graph/kafka_consumer.py`), then producer (`--count 50`) — consumer prints `[OK]` and `[ALERT]` lines
 10. `MATCH (i:Intersection) WHERE i.current_speed IS NOT NULL RETURN count(i)` > 0 in Neo4j Browser
 11. Congestion alert lines show resolved street names (e.g. `[ALERT] CONGESTION on Lambton Quay`)
+
+**Phase 11**
+12. `docker compose up -d` → `influxdb3-traffic` container running; `curl http://localhost:8181/health` returns `{"status":"ok"}`
+13. `bash start_pipeline.sh` → three PIDs printed; `/tmp/influx_consumer.log` shows `[flush]` lines within a few seconds
+14. Query InfluxDB: `curl -G http://localhost:8181/api/v3/query_sql --data-urlencode "db=traffic" --data-urlencode "q=SELECT COUNT(*) FROM traffic_sensor"` returns a non-zero count
+15. Open VS Code Command Palette → **MCP: List Servers** → `influxdb` listed and active
+16. Ask Copilot: *"What's the busiest intersection right now?"* — Copilot generates and executes SQL, returns a ranked answer
 
 ---
 
@@ -345,3 +458,9 @@ PRODUCER_DELAY=0.5
 - **Consumer `auto_offset_reset=latest`** — start consumer before producer to avoid missing messages; use `earliest` if replaying history
 - **Kafka in KRaft mode** — no ZooKeeper dependency; single-node, single-partition, sufficient for local simulation
 - **Credentials in `.env`** — loaded via `python-dotenv`, never hardcoded
+- **InfluxDB 3 `--without-auth`** — eliminates token management for local development; MCP package requires a non-empty `INFLUX_DB_TOKEN` value, so `local-dev-no-auth` is used as a placeholder
+- **InfluxDB 3 SQL, not Flux** — InfluxDB 3 Core uses Apache Arrow / Flight SQL; all queries are standard `SELECT … FROM … WHERE time > now() - INTERVAL '…'` syntax
+- **Batch + background-flush writer** — accumulating points and flushing on a background thread avoids per-message HTTP round-trips; the 1-second interval keeps latency low while the batch ceiling caps memory use
+- **MCP server via `npx`** — `@influxdata/influxdb3-mcp-server` is fetched and run on demand; no Docker build, no version pinning required for local use
+- **Database-context Markdown** — placing `database-context.md` alongside the consumer keeps schema documentation close to the code; the MCP server loads it automatically to ground LLM SQL generation
+- **Two separate consumers** — Neo4j and InfluxDB consumers are independent processes reading the same Kafka topics; either can be restarted without affecting the other
