@@ -158,7 +158,7 @@ Adds synthetic traffic advisory documents as `:Advisory` nodes linked to the int
 
 **New graph elements:**
 ```
-(:Advisory {id, title, text, published})
+(:Advisory {id, title, text, published, embedding})
   -[:AFFECTS_ROAD]->(:Intersection)
 ```
 
@@ -166,6 +166,8 @@ Adds synthetic traffic advisory documents as `:Advisory` nodes linked to the int
 - *"Lambton Quay closed between Willis St and Panama St for pipe replacement, 20–25 May"*
 - *"New 30 km/h speed limit on Courtenay Place effective 1 June"*
 - *"Temporary traffic lights at Cuba St / Vivian St intersection"*
+- *"Manners Street footpath reconstruction reduces carriageway to one lane"*
+- *"Willis Street raised pedestrian crossing works near Boulcott Street"*
 
 **Why GraphRAG beats plain RAG here:**
 1. User asks: *"Any disruptions on my route from the station to Courtenay Place?"*
@@ -180,9 +182,41 @@ The graph topology acts as a retrieval filter. A vector-only RAG has no concept 
 CREATE CONSTRAINT advisory_id IF NOT EXISTS
   FOR (a:Advisory) REQUIRE a.id IS UNIQUE
 
+-- 768 dimensions matches nomic-embed-text (local Ollama model)
 CREATE VECTOR INDEX advisory_text IF NOT EXISTS
   FOR (a:Advisory) ON (a.embedding)
-  OPTIONS {indexConfig: {`vector.dimensions`: 1536, `vector.similarity_function`: 'cosine'}}
+  OPTIONS {indexConfig: {`vector.dimensions`: 768, `vector.similarity_function`: 'cosine'}}
+```
+
+**Stack:** `langchain-ollama` (`OllamaEmbeddings` for 768-dim `nomic-embed-text` vectors, `ChatOllama` for synthesis)
+
+**Run:**
+```bash
+# Pull the embedding model (one-time)
+ollama pull nomic-embed-text
+
+# Load advisory nodes + embeddings + AFFECTS_ROAD links
+python src/load_advisories.py
+
+# Run 3 demo route queries
+python src/graphrag_retriever.py
+
+# Interactive mode: enter start/end streets and a question
+python src/graphrag_retriever.py --repl
+```
+
+REPL input format:
+```
+Start (street / street): Lambton Quay / Willis Street
+End   (street / street): Courtenay Place / Tory Street
+Question               : Any disruptions on this route?
+```
+
+**Optional `.env` overrides:**
+```
+OLLAMA_EMBED_MODEL=nomic-embed-text     # must be 768-dim; drop+recreate index if changed
+OLLAMA_MODEL=llama3.1:latest
+OLLAMA_BASE_URL=http://localhost:11434
 ```
 
 ---
@@ -266,8 +300,8 @@ Simulates IoT traffic sensors at intersections. The consumer writes live state b
 5. `python src/text2cypher.py` → ask *"Which intersection connects the most streets?"* — confirm Cypher printed and answer returned
 
 **Phase 6**
-6. `python src/load_advisories.py` → `MATCH (a:Advisory) RETURN count(a)` > 0
-7. Ask *"Any disruptions near Lambton Quay?"* — confirm advisory text returned
+6. `python src/load_advisories.py` → `MATCH (a:Advisory) RETURN count(a)` returns 5; each advisory shows `size(a.embedding) = 768`
+7. `python src/graphrag_retriever.py` → three demo queries print a route osmid pair, then an LLM answer mentioning relevant advisory titles
 
 **Phase 7**
 8. `docker compose up -d` (with Kafka) → topics `sensor-readings` and `traffic-alerts` exist
