@@ -1,13 +1,43 @@
-# OpenStreetMap — Auckland CBD Road Network → Neo4j
+# Wellington CBD Traffic Intelligence
 
-Download the Auckland CBD drivable road graph via OSMNx, enrich it with speeds and travel times, then batch-load intersections (nodes) and road segments (weighted relationships) into a local Neo4j Docker instance with the GDS plugin. Deliverable is 3 Python scripts + docker-compose, ending with working Dijkstra shortest-path queries.
+A progressive experiment building a smart-city graph pipeline on top of the Wellington CBD road network:
+
+| Phase | What | Stack |
+|---|---|---|
+| **1–4** | Road graph → Neo4j | OSMNx · Neo4j 5 · GDS |
+| **5** | Natural language analytics | LangChain · `GraphCypherQAChain` |
+| **6** | Route-aware document Q&A | GraphRAG · Neo4j Vector |
+| **7** | Live traffic simulation | Kafka · stream processor |
+
+Each phase builds on the same Neo4j instance and the same `docker-compose.yml`.
+
+---
+
+## Quick Start (Phases 1–4)
+
+```bash
+# 1. Install Python dependencies
+pip install -r requirements.txt
+
+# 2. Create .env with Neo4j credentials
+cp .env.example .env   # or create manually — see below
+
+# 3. Start Neo4j (downloads GDS plugin automatically)
+docker compose up -d
+
+# 4. Download and cache the Wellington CBD road network
+python src/download_network.py
+
+# 5. Ingest cached graph into Neo4j
+python src/ingest_to_neo4j.py
+```
 
 ---
 
 ## Phase 1 — Project Scaffolding
 
 1. `requirements.txt` — `osmnx>=2.0`, `neo4j>=5.0`, `python-dotenv`, `shapely`
-2. `docker-compose.yml` — `neo4j:5-community` image, `NEO4J_PLUGINS: '["graph-data-science"]'` env var (auto-downloads GDS Community JAR), ports 7474/7687, `./data` and `./logs` volume mounts
+2. `docker-compose.yml` — `neo4j:5-community` image, `NEO4J_PLUGINS: '["graph-data-science"]'` env var (auto-downloads GDS Community JAR), ports 7474/7687, `./data` and `./logs` volume mounts, 2 GB heap
 3. `.env` — `NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD` (gitignored)
 4. `pip install -r requirements.txt` *(depends on step 1)*
 
@@ -15,121 +45,234 @@ Download the Auckland CBD drivable road graph via OSMNx, enrich it with speeds a
 
 ## Phase 2 — Download & Enrich (`src/download_network.py`)
 
-5. `ox.graph_from_place("Auckland CBD, Auckland, New Zealand", network_type="drive")` → `networkx.MultiDiGraph`
-6. `ox.add_edge_speeds(G, fallback=50)` → imputes `speed_kph` on every edge (auto-converts mph → kph)
-7. `ox.add_edge_travel_times(G)` → adds `travel_time` (seconds) per edge
-8. Cache to `data/auckland_cbd.graphml` via `ox.save_graphml` — guarded so re-runs skip the download
+5. Bounding box for Wellington CBD (~1 km × 1 km): `north=-41.276, south=-41.295, east=174.785, west=174.770`
+6. `ox.graph_from_bbox((west, south, east, north), network_type="drive")` → `networkx.MultiDiGraph`
+7. `ox.add_edge_speeds(G, fallback=50)` → imputes `speed_kph` on every edge (auto-converts mph → kph)
+8. `ox.add_edge_travel_times(G)` → adds `travel_time` (seconds) per edge
+9. Cache to `data/wellington_cbd.graphml` via `ox.save_graphml` — guarded so re-runs skip the download
 
 ---
 
-## Phase 3 — Neo4j Schema (`src/load_neo4j.py`) — *depends on Docker running*
+## Phase 3 — Neo4j Schema (`src/schema.py`) — *depends on Docker running*
 
-9. Uniqueness constraint:
+Applied automatically by `ingest_to_neo4j.py`. Statements:
+
+**Constraint**
+```cypher
+CREATE CONSTRAINT intersection_osmid IF NOT EXISTS
+  FOR (n:Intersection) REQUIRE n.osmid IS UNIQUE
+```
+
+**Indexes**
+```cypher
+CREATE INDEX intersection_location IF NOT EXISTS
+  FOR (n:Intersection) ON (n.lat, n.lon)
+
+CREATE INDEX road_highway IF NOT EXISTS
+  FOR ()-[r:ROAD]-() ON (r.highway)
+
+CREATE TEXT INDEX road_name IF NOT EXISTS
+  FOR ()-[r:ROAD]-() ON (r.name)
+```
+
+---
+
+## Phase 4 — Batch Ingest (`src/ingest_to_neo4j.py`) — *depends on Phase 2 + 3*
+
+Clears any existing graph, applies schema, then loads in batches of 500.
+
+**Nodes** — from `G.nodes(data=True)`:
+
+| Property | Type | Source |
+|---|---|---|
+| `osmid` | INTEGER | OSM node ID (unique key) |
+| `lat` | FLOAT | WGS-84 latitude (y) |
+| `lon` | FLOAT | WGS-84 longitude (x) |
+| `street_count` | INTEGER | edges meeting at node |
+
+```cypher
+UNWIND $batch AS n
+MERGE (i:Intersection {osmid: n.osmid})
+SET i.lat = n.lat, i.lon = n.lon, i.street_count = n.street_count
+```
+
+**Relationships** (`:ROAD`) — from `G.edges(data=True)`:
+
+| Property | Type | Notes |
+|---|---|---|
+| `osmid` | INTEGER | OSM way ID; list → take first |
+| `name` | STRING | street name |
+| `highway` | STRING | OSM highway tag |
+| `maxspeed` | STRING | posted speed limit string |
+| `length` | FLOAT | metres |
+| `speed_kph` | FLOAT | inferred/posted speed |
+| `travel_time` | FLOAT | seconds |
+| `oneway` | BOOLEAN | |
+| `reversed` | BOOLEAN | edge reversed during simplification |
+
+```cypher
+UNWIND $batch AS e
+MATCH (a:Intersection {osmid: e.u})
+MATCH (b:Intersection {osmid: e.v})
+CREATE (a)-[r:ROAD]->(b)
+SET r.osmid = e.osmid, r.name = e.name, r.highway = e.highway,
+    r.maxspeed = e.maxspeed, r.length = e.length,
+    r.speed_kph = e.speed_kph, r.travel_time = e.travel_time,
+    r.oneway = e.oneway, r.reversed = e.reversed
+```
+
+---
+
+## Phase 5 — Text2Cypher (`src/text2cypher.py`) — *depends on Phase 4*
+
+Natural language interface over the static road graph. A user asks a plain-English question; LangChain generates and executes the Cypher, then returns a natural language answer.
+
+**Example questions:**
+- *"Which road type has the most segments?"* → aggregates on `r.highway`
+- *"What percentage of roads are one-way?"* → filters on `r.oneway`
+- *"Which intersection connects the most streets?"* → orders by `i.street_count DESC`
+- *"Which named street has the longest total length?"* → groups by `r.name`, sums `r.length`
+- *"How many dead-end intersections are there?"* → filters `i.street_count = 1`
+
+**Stack:** `langchain-neo4j` (`Neo4jGraph` + `GraphCypherQAChain`), `langchain-openai`
+
+`Neo4jGraph` auto-introspects the schema — no manual description needed. `verbose=True` prints generated Cypher alongside the answer for easy validation.
+
+**New `.env` key:** `OPENAI_API_KEY`
+
+---
+
+## Phase 6 — GraphRAG (`src/load_advisories.py` + `src/graphrag_retriever.py`) — *depends on Phase 5*
+
+Adds synthetic traffic advisory documents as `:Advisory` nodes linked to the intersections they mention. Q&A can now blend graph topology with free-text knowledge.
+
+**New graph elements:**
+```
+(:Advisory {id, title, text, published})
+  -[:AFFECTS_ROAD]->(:Intersection)
+```
+
+**Example advisories (synthetic):**
+- *"Lambton Quay closed between Willis St and Panama St for pipe replacement, 20–25 May"*
+- *"New 30 km/h speed limit on Courtenay Place effective 1 June"*
+- *"Temporary traffic lights at Cuba St / Vivian St intersection"*
+
+**Why GraphRAG beats plain RAG here:**
+1. User asks: *"Any disruptions on my route from the station to Courtenay Place?"*
+2. GDS Dijkstra finds the route intersections
+3. Advisories linked to intersections **along that path** are retrieved — not just keyword-matched docs
+4. LLM synthesises a route-aware answer
+
+The graph topology acts as a retrieval filter. A vector-only RAG has no concept of spatial adjacency.
+
+**New schema additions** (appended to `src/schema.py`):
+```cypher
+CREATE CONSTRAINT advisory_id IF NOT EXISTS
+  FOR (a:Advisory) REQUIRE a.id IS UNIQUE
+
+CREATE VECTOR INDEX advisory_text IF NOT EXISTS
+  FOR (a:Advisory) ON (a.embedding)
+  OPTIONS {indexConfig: {`vector.dimensions`: 1536, `vector.similarity_function`: 'cosine'}}
+```
+
+---
+
+## Phase 7 — Kafka Streaming (`src/kafka_producer.py` + `src/kafka_consumer.py`) — *depends on Phase 4*
+
+Simulates IoT traffic sensors at intersections. The consumer writes live state back into Neo4j; Text2Cypher and GraphRAG queries automatically reflect real-time conditions.
+
+**Topics:**
+
+| Topic | Direction | Payload |
+|---|---|---|
+| `sensor-readings` | producer → consumer | `{intersection_osmid, vehicle_count, avg_speed_kph, ts}` |
+| `traffic-alerts` | consumer → downstream | `{type, osmid, street, speed_kph, ts}` |
+
+**Consumer logic:**
+1. Consume from `sensor-readings`
+2. Write live state to Neo4j:
    ```cypher
-   CREATE CONSTRAINT intersection_osmid IF NOT EXISTS
-     FOR (i:Intersection) REQUIRE i.osmid IS UNIQUE;
+   MATCH (i:Intersection {osmid: $osmid})
+   SET i.current_flow = $vehicle_count,
+       i.current_speed = $avg_speed,
+       i.last_seen = $ts
    ```
-10. Location index:
-    ```cypher
-    CREATE INDEX intersection_location IF NOT EXISTS
-      FOR (i:Intersection) ON (i.latitude, i.longitude);
-    ```
+3. If `avg_speed_kph < 15` → produce a `CONGESTION` alert to `traffic-alerts`
+
+**Producer:** picks random intersections, generates plausible readings with occasional congestion spikes.
+
+**Text2Cypher on live data:** *"Which intersections are currently congested?"* → `WHERE i.current_speed < 15`
+
+**GraphRAG on live data:** *"Is there a known reason for congestion on Willis Street?"* → retrieves linked advisories + checks `i.current_speed`
+
+**Docker addition** (`docker-compose.yml`):
+```yaml
+  kafka:
+    image: apache/kafka:3.7.0
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+```
 
 ---
 
-## Phase 4 — Batch Load Nodes — *depends on Phase 3*
-
-11. Iterate `G.nodes(data=True)` → dicts with `{osmid, latitude (y), longitude (x), street_count}`
-12. Chunks of 5,000:
-    ```cypher
-    UNWIND $batch AS row
-    MERGE (i:Intersection {osmid: row.osmid})
-    SET i += {latitude: row.latitude, longitude: row.longitude, street_count: row.street_count}
-    ```
-
----
-
-## Phase 5 — Batch Load Relationships — *depends on Phase 4*
-
-13. Iterate `G.edges(keys=True, data=True)` → dicts with `u`, `v`, `osmid`, `name`, `highway`, `oneway`, `length`, `speed_kph`, `travel_time`, `lanes`
-    - Edge `osmid` can be a list (consolidated ways) → take `osmid[0]`
-    - `geometry` (Shapely LineString) **skipped** for now — can be added as WKT later
-    - OSMNx already mirrors bidirectional streets as two directed edges — no manual duplication needed
-14. Chunks of 5,000:
-    ```cypher
-    UNWIND $batch AS row
-    MATCH (a:Intersection {osmid: row.u}), (b:Intersection {osmid: row.v})
-    MERGE (a)-[r:ROAD_SEGMENT {osmid: row.osmid}]->(b)
-    SET r += {name: row.name, highway: row.highway, oneway: row.oneway,
-              length: row.length, speed_kph: row.speed_kph,
-              travel_time: row.travel_time, lanes: row.lanes}
-    ```
-
----
-
-## Phase 6 — Shortest Path Queries (`src/queries.py`)
-
-15. **Hop count** (built-in Cypher, no plugin required):
-    ```cypher
-    MATCH (a:Intersection {osmid: $start}), (b:Intersection {osmid: $end})
-    MATCH path = shortestPath((a)-[*..200]->(b))
-    RETURN path, length(path) AS hop_count
-    ```
-
-16. **Weighted Dijkstra** (GDS plugin):
-    ```cypher
-    -- Project a named graph
-    CALL gds.graph.project(
-      'road_net',
-      'Intersection',
-      'ROAD_SEGMENT',
-      { relationshipProperties: ['travel_time', 'length'] }
-    );
-
-    -- Run Dijkstra (fastest route by travel time)
-    CALL gds.shortestPath.dijkstra.stream('road_net', {
-      sourceNode: $startNodeId,
-      targetNode: $endNodeId,
-      relationshipWeightProperty: 'travel_time'
-    })
-    YIELD index, totalCost, nodeIds, costs
-    RETURN index, totalCost, nodeIds, costs;
-    ```
-
----
-
-## Project Structure
+## Project Structure (end state)
 
 ```
 .
-├── .env                        # Neo4j credentials (gitignored)
-├── docker-compose.yml          # Neo4j 5 Community + GDS plugin
-├── requirements.txt            # osmnx, neo4j, python-dotenv, shapely
+├── .env                          # Neo4j + OpenAI credentials (gitignored)
+├── docker-compose.yml            # Neo4j 5 + GDS + Kafka
+├── requirements.txt
 ├── data/
-│   └── auckland_cbd.graphml    # Cached OSMNx graph (generated)
+│   └── wellington_cbd.graphml   # Cached OSMNx graph (generated)
 └── src/
-    ├── download_network.py     # OSMNx download, enrich, cache
-    ├── load_neo4j.py           # Schema setup + batched node/rel load
-    └── queries.py              # Sample shortest-path Cypher queries
+    ├── download_network.py       # Phase 2: OSMNx download, enrich, cache
+    ├── schema.py                 # Phase 3: constraints + indexes (inc. vector)
+    ├── ingest_to_neo4j.py        # Phase 4: batched node/rel load
+    ├── text2cypher.py            # Phase 5: LangChain GraphCypherQAChain
+    ├── load_advisories.py        # Phase 6: insert synthetic advisory docs
+    ├── graphrag_retriever.py     # Phase 6: path-aware retrieval chain
+    ├── kafka_producer.py         # Phase 7: simulated sensor readings
+    └── kafka_consumer.py         # Phase 7: graph updates + alert emission
 ```
 
 ---
 
 ## Verification Checklist
 
+**Phases 1–4**
 1. `docker compose up -d` → open http://localhost:7474, confirm GDS shows in `:sysinfo`
-2. `python src/download_network.py` → confirm `data/auckland_cbd.graphml` created; check printed node/edge counts
-3. `python src/load_neo4j.py` → run `MATCH (i:Intersection) RETURN count(i)` — should match `len(G.nodes)`
-4. `MATCH ()-[r:ROAD_SEGMENT]->() RETURN count(r)` — should match `len(G.edges)`
-5. Run the hop-count `shortestPath` query in Neo4j Browser with two real `osmid` values
-6. Project the GDS graph and run `gds.shortestPath.dijkstra.stream` — confirm `totalCost > 0`
+2. `python src/download_network.py` → confirm `data/wellington_cbd.graphml` created; check printed node/edge counts
+3. `python src/ingest_to_neo4j.py` → `MATCH (i:Intersection) RETURN count(i)` matches node count
+4. `MATCH ()-[r:ROAD]->() RETURN count(r)` matches edge count
+
+**Phase 5**
+5. `python src/text2cypher.py` → ask *"Which intersection connects the most streets?"* — confirm Cypher printed and answer returned
+
+**Phase 6**
+6. `python src/load_advisories.py` → `MATCH (a:Advisory) RETURN count(a)` > 0
+7. Ask *"Any disruptions near Lambton Quay?"* — confirm advisory text returned
+
+**Phase 7**
+8. `docker compose up -d` (with Kafka) → topics `sensor-readings` and `traffic-alerts` exist
+9. Run producer + consumer simultaneously — confirm `i.current_speed` values update in Neo4j
+10. Trigger a congestion spike — confirm alert appears on `traffic-alerts`
 
 ---
 
 ## Decisions & Scope
 
-- **Auckland CBD only** — avoids a multi-GB full-city graph; expand later by changing the place string
+- **Wellington CBD only** — compact ~1 km × 1 km bbox; expand by adjusting `BBOX` in `download_network.py`
+- **Bounding box over place query** — more reliable than a place-name geocode for a compact area
 - **GDS via Docker env var** — `NEO4J_PLUGINS` auto-downloads the Community JAR; no manual placement
 - **Edge geometry skipped** — keeps the model simple; add as WKT string later if spatial queries are needed
-- **Enrichment in Python** — speed and travel_time computed before import; cheaper than post-load Neo4j compute
+- **Enrichment in Python** — `speed_kph` and `travel_time` computed before import; cheaper than post-load compute
+- **Advisories are synthetic** — no real data source required; realistic enough to demo GraphRAG spatial retrieval
+- **Kafka in KRaft mode** — no ZooKeeper dependency; single-node, single-partition, sufficient for local simulation
 - **Credentials in `.env`** — loaded via `python-dotenv`, never hardcoded
