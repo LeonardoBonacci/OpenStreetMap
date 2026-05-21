@@ -18,6 +18,8 @@ The project stitches together five concerns that any real urban-intelligence pla
 | **Structural analytics** | Neo4j GDS (Betweenness, PageRank) | Identifies critical bottleneck intersections in the network |
 | **Temporal memory** | Neo4j native datetime + :TrafficSnapshot | Time-series history enables rush-hour patterns and congestion duration |
 | **Traffic signal control** | Approach sensors on :ROAD + :TrafficLight nodes | Demand-responsive green-time allocation from per-road sensor data |
+| **High-resolution time-series** | InfluxDB 3 Core | Sub-second sensor writes, long-term retention, efficient aggregate queries |
+| **Conversational analytics** | InfluxDB MCP Server + GitHub Copilot / Claude | Natural-language SQL queries against live traffic time-series |
 
 None of these is novel in isolation. The novelty is their **composition**: every query can simultaneously touch static geometry, live traffic state, and semantic advisory text, all within the same graph traversal.
 
@@ -85,6 +87,28 @@ load_advisories.py         ← Phase 6    kafka_producer.py   ← Phase 7 & 10
                                       reads sensor_queue from inbound ROADs
                                       computes NS/EW green-time split
                                       writes phase + green_ns/ew to :TrafficLight
+                                          │
+                    ┌─────────────────────┘
+                    │  (same Kafka topics)
+                    ▼
+          influx_consumer.py   ← Phase 11
+            subscribes to sensor-readings + approach-sensors
+            batches up to 100 pts or 1 s flush interval
+            writes to InfluxDB 3 Core:
+              traffic_sensor{intersection_osmid}   vehicle_count, avg_speed_kph
+              approach_sensor{from_osmid,to_osmid} queue_length, arrival_rate, occupancy_pct
+                    │
+                    ▼
+          InfluxDB 3 Core (http://localhost:8181)
+          database: traffic
+                    │
+          ┌─────────┴──────────────────────┐
+          ▼                                ▼
+  Grafana dashboard              MCP Server (npx @influxdata/influxdb3-mcp-server)
+  (http://localhost:3000)          │
+  Infinity datasource →            ▼
+  live SQL queries           GitHub Copilot / Claude Desktop
+                             "Which intersections are congested right now?"
 ```
 
 ---
@@ -326,6 +350,76 @@ ORDER BY b.criticality DESC
 
 This closes the loop from **sensing** (approach sensors on roads) through **reasoning** (demand computation) to **actuation** (traffic light phase allocation) — all within the graph.
 
+### Phase 11 — InfluxDB Time-Series + MCP Conversational Analytics (`src/influxdb/influx_consumer.py`)
+
+While Neo4j keeps *current state* and *graph-structured history*, InfluxDB 3 Core keeps the **raw high-resolution time-series** — every single sensor reading at full fidelity, queryable via SQL with sub-second precision.
+
+`influx_consumer.py` subscribes to both Kafka topics in parallel and writes two measurements:
+
+| Measurement | Tags | Fields |
+|---|---|---|
+| `traffic_sensor` | `intersection_osmid` | `vehicle_count`, `avg_speed_kph` |
+| `approach_sensor` | `from_osmid`, `to_osmid` | `queue_length`, `arrival_rate`, `occupancy_pct` |
+
+Points are batched (up to 100 points or 1 s flush interval) and written with the original sensor timestamp so that historical queries reflect actual event time, not ingestion lag.
+
+Run it:
+```bash
+python src/influxdb/influx_consumer.py          # runs until Ctrl-C
+python src/influxdb/influx_consumer.py --once   # consume until idle, then exit
+```
+
+Or start the full pipeline including InfluxDB consumer:
+```bash
+./start_pipeline.sh
+```
+
+**Grafana dashboard** — open `http://localhost:3000` (admin / admin).  The InfluxDB3-Traffic datasource is pre-provisioned via `grafana/provisioning/`.  Use the Infinity datasource panel to run any SQL query below directly in the UI.
+
+**MCP Conversational Interface** — the InfluxDB MCP Server is pre-configured in `.vscode/mcp.json`.  Restart VS Code after `docker compose up -d` and ask Copilot:
+
+> "Which intersections have had average speed below 15 km/h in the last 10 minutes?"
+> "What was the peak queue length on any approach in the last hour?"
+> "Compare vehicle throughput between intersection 268939537 and the network average today."
+
+Key SQL queries this enables:
+```sql
+-- Network congestion pulse (last 5 minutes)
+SELECT
+    COUNT(DISTINCT intersection_osmid)              AS monitored,
+    COUNT(CASE WHEN avg_speed_kph < 15 THEN 1 END) AS congested_readings,
+    ROUND(AVG(avg_speed_kph), 1)                    AS network_speed_kph
+FROM traffic_sensor
+WHERE time > now() - INTERVAL '5 minutes'
+```
+
+```sql
+-- Top 10 worst approaches right now
+SELECT from_osmid, to_osmid,
+       ROUND(AVG(queue_length), 1)   AS avg_queue,
+       ROUND(AVG(occupancy_pct), 1)  AS avg_occupancy
+FROM approach_sensor
+WHERE time > now() - INTERVAL '2 minutes'
+GROUP BY from_osmid, to_osmid
+ORDER BY avg_queue DESC
+LIMIT 10
+```
+
+```sql
+-- One-minute bucketed speed trend for a specific intersection
+SELECT
+    date_trunc('minute', time) AS bucket,
+    AVG(avg_speed_kph)         AS avg_speed,
+    SUM(vehicle_count)         AS total_vehicles
+FROM traffic_sensor
+WHERE intersection_osmid = '268939537'
+  AND time > now() - INTERVAL '1 hour'
+GROUP BY bucket
+ORDER BY bucket
+```
+
+This adds a **purpose-built time-series layer** alongside the graph: InfluxDB handles million-row aggregate scans efficiently where Neo4j excels at graph traversal, and the MCP server bridges the gap to conversational AI without any custom prompt engineering.
+
 ---
 
 ## Observing Live Changes in Neo4j
@@ -439,6 +533,8 @@ A city council, research lab, or startup can stand this up in an afternoon and i
 | Public alerts API | Expose the `traffic-alerts` Kafka topic via a WebSocket endpoint |
 | Historical replay | \u2705 Done — `kafka_consumer.py` writes `:TrafficSnapshot` nodes with native `datetime`; `traffic_history.py` analyses patterns |
 | Traffic signal control | ✅ Done — `traffic_light_controller.py` reads approach sensors, computes demand-responsive green splits |
+| High-resolution time-series | ✅ Done — `influx_consumer.py` writes both Kafka topics to InfluxDB 3 Core at full resolution |
+| Conversational time-series queries | ✅ Done — InfluxDB MCP Server wired into `.vscode/mcp.json`; ask Copilot directly |
 | Multi-modal transport | Add `:BusRoute`, `:TrainLine` nodes linked to `:Intersection` by proximity |
 
 ---
@@ -448,3 +544,5 @@ A city council, research lab, or startup can stand this up in an afternoon and i
 - [Neo4j Graph Data Science](https://neo4j.com/product/graph-data-science/) — GDS library used for Betweenness Centrality and PageRank analytics
 - [Text2Cypher Guide](https://neo4j.com/blog/genai/text2cypher-guide/) — Natural-language to Cypher query generation patterns
 - [GraphRAG with Python](https://neo4j.com/developer/genai-ecosystem/graphrag-python/) — Graph-augmented retrieval-augmented generation with Neo4j and LangChain
+- [InfluxDB 3 Core](https://www.influxdata.com/products/influxdb/) — Open-source time-series database used for sensor data storage
+- [InfluxDB MCP Server](https://github.com/influxdata/influxdb3-mcp-server) — MCP server for natural-language SQL queries against InfluxDB 3
