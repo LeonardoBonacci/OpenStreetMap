@@ -38,6 +38,22 @@ Relationship types
     flow         INTEGER   -- vehicle count at time of reading
     recorded_at  DATETIME  -- Neo4j native datetime of the reading
 
+:TrafficLight  (Phase 10)
+    osmid        INTEGER   -- references parent Intersection (unique)
+    cycle_time   INTEGER   -- total cycle length in seconds (e.g. 90)
+    current_phase STRING   -- active phase label (e.g. 'NS_GREEN', 'EW_GREEN')
+    phase_updated_at STRING -- ISO-8601 timestamp of last phase transition
+    green_ns     FLOAT     -- fraction of cycle allocated to north-south (0–1)
+    green_ew     FLOAT     -- fraction of cycle allocated to east-west (0–1)
+
+:HAS_LIGHT  (:Intersection)-[:HAS_LIGHT]->(:TrafficLight)  (Phase 10)
+
+Additional :ROAD properties (Phase 10 — approach sensors):
+    sensor_queue       INTEGER -- vehicles queued approaching destination intersection
+    sensor_arrival_rate FLOAT  -- vehicles/min arriving at destination
+    sensor_occupancy   FLOAT   -- inductive loop occupancy % (0–100)
+    sensor_ts          STRING  -- ISO-8601 timestamp of last sensor reading
+
 Constraints & indexes
 ---------------------
 UNIQUE  Intersection.osmid          (also creates a b-tree lookup index)
@@ -47,6 +63,8 @@ TEXT    ROAD(name)                  (substring / full-text search)
 UNIQUE  Advisory.id                 (Phase 6)
 VECTOR  Advisory(embedding)         (Phase 6 — 768 dims, cosine, nomic-embed-text)
 RANGE   TrafficSnapshot(recorded_at) (Phase 9 — temporal queries)
+UNIQUE  TrafficLight.osmid           (Phase 10)
+RANGE   ROAD(sensor_queue)           (Phase 10 — approach sensor queries)
 """
 
 SCHEMA_STATEMENTS = [
@@ -79,6 +97,13 @@ SCHEMA_STATEMENTS = [
     # ---------- Phase 9: Temporal traffic snapshots ----------
     """CREATE INDEX snapshot_recorded_at IF NOT EXISTS
        FOR (s:TrafficSnapshot) ON (s.recorded_at)""",
+
+    # ---------- Phase 10: Traffic light control ----------
+    """CREATE CONSTRAINT traffic_light_osmid IF NOT EXISTS
+       FOR (t:TrafficLight) REQUIRE t.osmid IS UNIQUE""",
+
+    """CREATE INDEX road_sensor_queue IF NOT EXISTS
+       FOR ()-[r:ROAD]-() ON (r.sensor_queue)""",
 ]
 
 

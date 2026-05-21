@@ -1,24 +1,13 @@
 """
-Phase 7 — Kafka Consumer (src/kafka_consumer.py)
+Phase 7 & 10 — Kafka Consumer (src/kafka_consumer.py)
 
-Consumes sensor readings from the 'sensor-readings' topic and writes live
-traffic state back into Neo4j :Intersection nodes. Emits CONGESTION alerts
-to the 'traffic-alerts' topic when avg_speed_kph < 15.
-
-Neo4j writes (per message):
-    MATCH (i:Intersection {osmid: $osmid})
-    SET i.current_flow  = $vehicle_count,
-        i.current_speed = $avg_speed_kph,
-        i.last_seen     = $ts
-
-Alert payload (JSON) → topic 'traffic-alerts':
-    {
-      "type":       "CONGESTION",
-      "osmid":      <int>,
-      "street":     <string | null>,   # name of a road at that intersection
-      "speed_kph":  <float>,
-      "ts":         <ISO-8601 UTC string>
-    }
+Consumes from two topics:
+  1. 'sensor-readings'  — writes live traffic state to :Intersection nodes,
+                           creates :TrafficSnapshot history, emits congestion
+                           alerts to 'traffic-alerts'.
+  2. 'approach-sensors' — writes per-road approach sensor data (queue length,
+                           arrival rate, occupancy) onto :ROAD relationships.
+                           This data feeds the traffic-light controller.
 
 Usage:
     python src/kafka_consumer.py    # runs until Ctrl-C
@@ -49,8 +38,9 @@ NEO4J_PASSWORD  = os.getenv("NEO4J_PASSWORD",  "")
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "localhost:9092")
 CONSUMER_GROUP  = os.getenv("CONSUMER_GROUP",  "traffic-consumer")
 
-TOPIC_IN  = "sensor-readings"
-TOPIC_OUT = "traffic-alerts"
+TOPIC_IN        = "sensor-readings"
+TOPIC_APPROACH  = "approach-sensors"
+TOPIC_OUT       = "traffic-alerts"
 CONGESTION_THRESHOLD = 15.0   # km/h
 
 
@@ -105,6 +95,31 @@ def lookup_street(session, osmid: int) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Approach-sensor Neo4j helper (Phase 10)
+# ---------------------------------------------------------------------------
+
+_APPROACH_CYPHER = """
+MATCH (a:Intersection {osmid: $from_osmid})-[r:ROAD]->(b:Intersection {osmid: $to_osmid})
+SET r.sensor_queue        = $queue_length,
+    r.sensor_arrival_rate = $arrival_rate,
+    r.sensor_occupancy    = $occupancy_pct,
+    r.sensor_ts           = $ts
+"""
+
+
+def write_approach_to_neo4j(session, msg: dict):
+    session.run(
+        _APPROACH_CYPHER,
+        from_osmid=msg["from_osmid"],
+        to_osmid=msg["to_osmid"],
+        queue_length=msg["queue_length"],
+        arrival_rate=msg["arrival_rate"],
+        occupancy_pct=msg["occupancy_pct"],
+        ts=msg["ts"],
+    ).consume()
+
+
+# ---------------------------------------------------------------------------
 # Alert helper
 # ---------------------------------------------------------------------------
 
@@ -127,7 +142,7 @@ def run():
 
     try:
         consumer = KafkaConsumer(
-            TOPIC_IN,
+            TOPIC_IN, TOPIC_APPROACH,
             bootstrap_servers=KAFKA_BOOTSTRAP,
             group_id=CONSUMER_GROUP,
             auto_offset_reset="latest",
@@ -142,32 +157,48 @@ def run():
         print(f"Cannot connect to Kafka at {KAFKA_BOOTSTRAP}. Is docker compose up?", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Consuming from '{TOPIC_IN}'  |  alerts → '{TOPIC_OUT}'  (Ctrl-C to stop)")
+    print(
+        f"Consuming from '{TOPIC_IN}' + '{TOPIC_APPROACH}'  "
+        f"|  alerts → '{TOPIC_OUT}'  (Ctrl-C to stop)"
+    )
 
     try:
         with driver.session() as session:
             for kafka_msg in consumer:
-                msg = kafka_msg.value
-                osmid     = msg["intersection_osmid"]
-                speed_kph = msg["avg_speed_kph"]
+                topic = kafka_msg.topic
+                msg   = kafka_msg.value
 
-                write_to_neo4j(session, msg)
-
-                if speed_kph < CONGESTION_THRESHOLD:
-                    street = lookup_street(session, osmid)
-                    alert  = build_alert(osmid, street, speed_kph)
-                    alert_producer.send(TOPIC_OUT, alert)
-                    street_label = f" on {street}" if street else ""
+                if topic == TOPIC_APPROACH:
+                    # --- Phase 10: approach-sensor data → ROAD properties ---
+                    write_approach_to_neo4j(session, msg)
                     print(
-                        f"  [ALERT] CONGESTION{street_label}  "
-                        f"osmid={osmid}  speed={speed_kph} km/h"
+                        f"  [SENSOR] {msg['from_osmid']}→{msg['to_osmid']}  "
+                        f"queue={msg['queue_length']:>2}  "
+                        f"rate={msg['arrival_rate']:>5.1f}/min  "
+                        f"occ={msg['occupancy_pct']:>5.1f}%"
                     )
                 else:
-                    print(
-                        f"  [OK]    osmid={osmid:>12}  "
-                        f"speed={speed_kph:>5.1f} km/h  "
-                        f"vehicles={msg['vehicle_count']:>3}"
-                    )
+                    # --- Phase 7: intersection reading ---
+                    osmid     = msg["intersection_osmid"]
+                    speed_kph = msg["avg_speed_kph"]
+
+                    write_to_neo4j(session, msg)
+
+                    if speed_kph < CONGESTION_THRESHOLD:
+                        street = lookup_street(session, osmid)
+                        alert  = build_alert(osmid, street, speed_kph)
+                        alert_producer.send(TOPIC_OUT, alert)
+                        street_label = f" on {street}" if street else ""
+                        print(
+                            f"  [ALERT] CONGESTION{street_label}  "
+                            f"osmid={osmid}  speed={speed_kph} km/h"
+                        )
+                    else:
+                        print(
+                            f"  [OK]    osmid={osmid:>12}  "
+                            f"speed={speed_kph:>5.1f} km/h  "
+                            f"vehicles={msg['vehicle_count']:>3}"
+                        )
 
     except KeyboardInterrupt:
         print("\nStopped by user.")

@@ -105,6 +105,22 @@ def ingest(driver, G):
                 batch=edges[i:i + BATCH],
             )
 
+        # Phase 10: create a TrafficLight for every intersection
+        print("Creating :TrafficLight nodes...")
+        session.run(
+            """
+            MATCH (i:Intersection)
+            CREATE (i)-[:HAS_LIGHT]->(t:TrafficLight {
+                osmid:           i.osmid,
+                cycle_time:      90,
+                current_phase:   'NS_GREEN',
+                phase_updated_at: datetime().epochMillis,
+                green_ns:        0.5,
+                green_ew:        0.5
+            })
+            """
+        )
+
     print("Ingest complete.")
 
 

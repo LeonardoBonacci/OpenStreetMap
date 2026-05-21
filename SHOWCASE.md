@@ -17,6 +17,7 @@ The project stitches together five concerns that any real urban-intelligence pla
 | **Natural language interface** | Ollama (llama3.1) + LangChain | Both Text→Cypher analytics and GraphRAG route Q&A |
 | **Structural analytics** | Neo4j GDS (Betweenness, PageRank) | Identifies critical bottleneck intersections in the network |
 | **Temporal memory** | Neo4j native datetime + :TrafficSnapshot | Time-series history enables rush-hour patterns and congestion duration |
+| **Traffic signal control** | Approach sensors on :ROAD + :TrafficLight nodes | Demand-responsive green-time allocation from per-road sensor data |
 
 None of these is novel in isolation. The novelty is their **composition**: every query can simultaneously touch static geometry, live traffic state, and semantic advisory text, all within the same graph traversal.
 
@@ -34,25 +35,30 @@ download_network.py       ← Phase 2
   → data/wellington_cbd.graphml (cache)
       │
       ▼
-ingest_to_neo4j.py        ← Phases 3–4
+ingest_to_neo4j.py        ← Phases 3–4 & 10
   273 :Intersection nodes
   539 :ROAD relationships
+  273 :TrafficLight nodes (one per intersection, via [:HAS_LIGHT])
   schema: constraints, b-tree, text, spatial indexes
       │
       ├──────────────────────────────────────────┐
       ▼                                          ▼
-load_advisories.py         ← Phase 6    kafka_producer.py   ← Phase 7
-  5 :Advisory nodes                       reads 273 osmids from Neo4j
+load_advisories.py         ← Phase 6    kafka_producer.py   ← Phase 7 & 10
+  5 :Advisory nodes                       reads 273 osmids + 539 road pairs
   768-dim nomic-embed-text vectors        emits JSON to 'sensor-readings'
-  :AFFECTS_ROAD edges to                  topic every 0.5 s
-  affected :Intersections                        │
+  :AFFECTS_ROAD edges to                  and 'approach-sensors' topics
+  affected :Intersections                 every 0.5 s                        │
       │                                          ▼
-      │                                  kafka_consumer.py   ← Phase 7
-      │                                    consumes readings
-      │                                    writes current_speed,
-      │                                    current_flow, last_seen
-      │                                    to :Intersection nodes
-      │                                    → alerts → 'traffic-alerts'
+      │                                  kafka_consumer.py   ← Phase 7 & 10
+      │                                    consumes 'sensor-readings':
+      │                                      writes current_speed,
+      │                                      current_flow, last_seen
+      │                                      to :Intersection nodes
+      │                                      → alerts → 'traffic-alerts'
+      │                                    consumes 'approach-sensors':
+      │                                      writes sensor_queue,
+      │                                      sensor_arrival_rate,
+      │                                      sensor_occupancy to :ROAD
       │                                          │
       └──────────────────────────────────────────┘
                     │
@@ -60,10 +66,10 @@ load_advisories.py         ← Phase 6    kafka_producer.py   ← Phase 7
            Neo4j (bolt://localhost:7687)
            ┌───────────────────────────────────────────┐
            │  :Intersection  ──[:ROAD]──►  :Intersection│
-           │       ▲                                    │
-           │  [:AFFECTS_ROAD]                           │
-           │       │                                    │
-           │  :Advisory (+ 768-dim embedding vector)    │
+           │       │  ▲                                 │
+           │  [:HAS_LIGHT] [:AFFECTS_ROAD]              │
+           │       │         │                          │
+           │  :TrafficLight :Advisory (+embedding)      │
            └───────────────────────────────────────────┘
                     │
           ┌─────────┼──────────────────────────────────────┐
@@ -73,6 +79,12 @@ load_advisories.py         ← Phase 6    kafka_producer.py   ← Phase 7
   NL → Cypher     Dijkstra route →      Betweenness       Rush-hour patterns
   via llama3.1    advisory retrieval     Centrality +      chronic congestion
                   → LLM                  PageRank          duration queries
+                                                  │
+                                                  ▼
+                                    traffic_light_controller.py  ← Phase 10
+                                      reads sensor_queue from inbound ROADs
+                                      computes NS/EW green-time split
+                                      writes phase + green_ns/ew to :TrafficLight
 ```
 
 ---
@@ -262,6 +274,58 @@ ORDER BY i.criticality DESC
 
 This transforms the graph from a *current-state snapshot* into a **time-aware urban memory** — enabling pattern detection, anomaly baselines, and predictive queries with pure Cypher.
 
+### Phase 10 — Demand-Responsive Traffic Light Control (`src/traffic_light_controller.py`)
+
+Each intersection is given a `:TrafficLight` node (created during ingest). Each inbound `:ROAD` relationship carries approach-sensor properties updated in real time by the Kafka consumer:
+
+- `sensor_queue` — vehicles stopped at the approach
+- `sensor_arrival_rate` — vehicles/min arriving
+- `sensor_occupancy` — inductive loop occupancy %
+- `sensor_ts` — last reading timestamp
+
+The traffic-light controller runs a periodic cycle:
+1. Gathers sensor data from all inbound `:ROAD` relationships
+2. Classifies each approach as **NS** or **EW** based on geographic bearing
+3. Computes aggregate demand per direction: `demand = queue + 2 × arrival_rate`
+4. Allocates green-time proportionally (min 20% per direction)
+5. Writes `green_ns`, `green_ew`, `current_phase` back to `:TrafficLight`
+
+Run it:
+```bash
+python src/traffic_light_controller.py              # continuous (every 10s)
+python src/traffic_light_controller.py --once       # single pass
+python src/traffic_light_controller.py --interval 5 # 5-second cycle
+```
+
+Key queries this enables:
+```cypher
+-- Intersections where traffic lights favour NS direction
+MATCH (i:Intersection)-[:HAS_LIGHT]->(t:TrafficLight)
+WHERE t.green_ns > 0.6
+RETURN i.osmid, t.green_ns, t.green_ew, t.current_phase
+ORDER BY t.green_ns DESC LIMIT 10
+```
+
+```cypher
+-- Most congested approaches (highest queue lengths)
+MATCH (a:Intersection)-[r:ROAD]->(b:Intersection)
+WHERE r.sensor_queue IS NOT NULL
+RETURN a.osmid AS from, b.osmid AS to, r.name,
+       r.sensor_queue, r.sensor_arrival_rate
+ORDER BY r.sensor_queue DESC LIMIT 10
+```
+
+```cypher
+-- Traffic lights on critical bottlenecks that are currently overloaded
+MATCH (a:Intersection)-[r:ROAD]->(b:Intersection)-[:HAS_LIGHT]->(t:TrafficLight)
+WHERE b.criticality > 0.01 AND r.sensor_queue > 20
+RETURN b.osmid, b.criticality, r.sensor_queue,
+       t.current_phase, t.green_ns
+ORDER BY b.criticality DESC
+```
+
+This closes the loop from **sensing** (approach sensors on roads) through **reasoning** (demand computation) to **actuation** (traffic light phase allocation) — all within the graph.
+
 ---
 
 ## Observing Live Changes in Neo4j
@@ -374,6 +438,7 @@ A city council, research lab, or startup can stand this up in an afternoon and i
 | Route optimisation | ✅ Done — `gds_analytics.py` writes `criticality` + `pagerank` to every intersection |
 | Public alerts API | Expose the `traffic-alerts` Kafka topic via a WebSocket endpoint |
 | Historical replay | \u2705 Done — `kafka_consumer.py` writes `:TrafficSnapshot` nodes with native `datetime`; `traffic_history.py` analyses patterns |
+| Traffic signal control | ✅ Done — `traffic_light_controller.py` reads approach sensors, computes demand-responsive green splits |
 | Multi-modal transport | Add `:BusRoute`, `:TrainLine` nodes linked to `:Intersection` by proximity |
 
 ---

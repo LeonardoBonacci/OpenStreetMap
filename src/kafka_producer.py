@@ -49,12 +49,23 @@ KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "localhost:9092")
 PRODUCER_DELAY  = float(os.getenv("PRODUCER_DELAY", "0.5"))
 
 TOPIC = "sensor-readings"
+TOPIC_APPROACH = "approach-sensors"
 
 
 def fetch_osmids(driver) -> list[int]:
     with driver.session() as session:
         result = session.run("MATCH (i:Intersection) RETURN i.osmid AS osmid")
         return [r["osmid"] for r in result]
+
+
+def fetch_road_pairs(driver) -> list[tuple[int, int]]:
+    """Fetch all (from_osmid, to_osmid) pairs for ROAD relationships."""
+    with driver.session() as session:
+        result = session.run(
+            "MATCH (a:Intersection)-[:ROAD]->(b:Intersection) "
+            "RETURN a.osmid AS u, b.osmid AS v"
+        )
+        return [(r["u"], r["v"]) for r in result]
 
 
 def make_reading(osmid: int) -> dict:
@@ -74,6 +85,21 @@ def make_reading(osmid: int) -> dict:
     }
 
 
+def make_approach_reading(from_osmid: int, to_osmid: int) -> dict:
+    """Simulate an inductive-loop sensor on the approach to an intersection."""
+    queue_length  = random.randint(0, 40)
+    arrival_rate  = round(random.uniform(0.0, 30.0), 1)
+    occupancy_pct = round(random.uniform(0.0, 100.0), 1)
+    return {
+        "from_osmid":    from_osmid,
+        "to_osmid":      to_osmid,
+        "queue_length":  queue_length,
+        "arrival_rate":  arrival_rate,
+        "occupancy_pct": occupancy_pct,
+        "ts":            datetime.now(timezone.utc).isoformat(),
+    }
+
+
 def build_producer() -> KafkaProducer:
     return KafkaProducer(
         bootstrap_servers=KAFKA_BOOTSTRAP,
@@ -86,13 +112,14 @@ def build_producer() -> KafkaProducer:
 def run(count: int | None = None):
     driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
     osmids = fetch_osmids(driver)
+    road_pairs = fetch_road_pairs(driver)
     driver.close()
 
     if not osmids:
         print("No intersections found in Neo4j — run ingest_to_neo4j.py first.", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Loaded {len(osmids)} intersection osmids from Neo4j.")
+    print(f"Loaded {len(osmids)} intersections, {len(road_pairs)} road segments from Neo4j.")
 
     try:
         producer = build_producer()
@@ -100,10 +127,11 @@ def run(count: int | None = None):
         print(f"Cannot connect to Kafka at {KAFKA_BOOTSTRAP}. Is docker compose up?", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Producing to topic '{TOPIC}' at {KAFKA_BOOTSTRAP}  (Ctrl-C to stop)")
+    print(f"Producing to '{TOPIC}' + '{TOPIC_APPROACH}' at {KAFKA_BOOTSTRAP}  (Ctrl-C to stop)")
     sent = 0
     try:
         while count is None or sent < count:
+            # --- intersection-level reading (existing Phase 7) ---
             osmid   = random.choice(osmids)
             reading = make_reading(osmid)
             producer.send(TOPIC, reading)
@@ -113,6 +141,19 @@ def run(count: int | None = None):
                 f"speed={reading['avg_speed_kph']:>5.1f} km/h  "
                 f"vehicles={reading['vehicle_count']:>3}{flag}"
             )
+
+            # --- approach-sensor reading (Phase 10) ---
+            if road_pairs:
+                pair = random.choice(road_pairs)
+                approach = make_approach_reading(*pair)
+                producer.send(TOPIC_APPROACH, approach)
+                print(
+                    f"    sensor {pair[0]}→{pair[1]}  "
+                    f"queue={approach['queue_length']:>2}  "
+                    f"rate={approach['arrival_rate']:>5.1f}/min  "
+                    f"occ={approach['occupancy_pct']:>5.1f}%"
+                )
+
             sent += 1
             time.sleep(PRODUCER_DELAY)
     except KeyboardInterrupt:
