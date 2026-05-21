@@ -9,7 +9,7 @@ Download the Auckland CBD drivable road graph via OSMNx, enrich it with speeds a
 1. `requirements.txt` — `osmnx>=2.0`, `neo4j>=5.0`, `python-dotenv`, `shapely`
 2. `docker-compose.yml` — `neo4j:5-community` image, `NEO4J_PLUGINS: '["graph-data-science"]'` env var (auto-downloads GDS Community JAR), ports 7474/7687, `./data` and `./logs` volume mounts
 3. `.env` — `NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD` (gitignored)
-4. `python -m venv .venv && pip install -r requirements.txt` *(depends on step 1)*
+4. `pip install -r requirements.txt` *(depends on step 1)*
 
 ---
 

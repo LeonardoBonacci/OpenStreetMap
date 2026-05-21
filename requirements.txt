@@ -1,0 +1,4 @@
+osmnx>=2.0
+neo4j>=5.0
+python-dotenv
+shapely
