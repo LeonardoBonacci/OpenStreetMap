@@ -4,3 +4,4 @@ python-dotenv
 shapely
 langchain-neo4j
 langchain-ollama
+kafka-python>=2.0

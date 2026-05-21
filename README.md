@@ -237,31 +237,51 @@ Simulates IoT traffic sensors at intersections. The consumer writes live state b
 2. Write live state to Neo4j:
    ```cypher
    MATCH (i:Intersection {osmid: $osmid})
-   SET i.current_flow = $vehicle_count,
-       i.current_speed = $avg_speed,
-       i.last_seen = $ts
+   SET i.current_flow  = $vehicle_count,
+       i.current_speed = $avg_speed_kph,
+       i.last_seen     = $ts
    ```
-3. If `avg_speed_kph < 15` → produce a `CONGESTION` alert to `traffic-alerts`
+3. If `avg_speed_kph < 15` → look up the street name at that intersection, produce a `CONGESTION` alert (with street name) to `traffic-alerts`
 
-**Producer:** picks random intersections, generates plausible readings with occasional congestion spikes.
+**Producer:** picks random intersections, generates plausible readings with ~5 % congestion spikes. `--count N` sends exactly N messages then exits.
 
 **Text2Cypher on live data:** *"Which intersections are currently congested?"* → `WHERE i.current_speed < 15`
 
 **GraphRAG on live data:** *"Is there a known reason for congestion on Willis Street?"* → retrieves linked advisories + checks `i.current_speed`
 
-**Docker addition** (`docker-compose.yml`):
+**Run:**
+```bash
+# Terminal 1 — start consumer
+python src/kafka_consumer.py
+
+# Terminal 2 — stream sensor readings
+python src/kafka_producer.py              # continuous, Ctrl-C to stop
+python src/kafka_producer.py --count 50  # exactly 50 messages
+```
+
+**Optional `.env` overrides:**
+```
+KAFKA_BOOTSTRAP=localhost:9092
+CONSUMER_GROUP=traffic-consumer
+PRODUCER_DELAY=0.5
+```
+
+**Docker service** (`docker-compose.yml`) — KRaft mode, no ZooKeeper:
 ```yaml
   kafka:
     image: apache/kafka:3.7.0
-    ports:
-      - "9092:9092"
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
       KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qg
 ```
 
 ---
@@ -304,9 +324,10 @@ Simulates IoT traffic sensors at intersections. The consumer writes live state b
 7. `python src/graphrag_retriever.py` → three demo queries print a route osmid pair, then an LLM answer mentioning relevant advisory titles
 
 **Phase 7**
-8. `docker compose up -d` (with Kafka) → topics `sensor-readings` and `traffic-alerts` exist
-9. Run producer + consumer simultaneously — confirm `i.current_speed` values update in Neo4j
-10. Trigger a congestion spike — confirm alert appears on `traffic-alerts`
+8. `docker compose up -d` → both `neo4j-road-net` and `kafka-traffic` containers running
+9. Start consumer (`python src/kafka_consumer.py`), then producer (`--count 50`) — consumer prints `[OK]` and `[ALERT]` lines
+10. `MATCH (i:Intersection) WHERE i.current_speed IS NOT NULL RETURN count(i)` > 0 in Neo4j Browser
+11. Congestion alert lines show resolved street names (e.g. `[ALERT] CONGESTION on Lambton Quay`)
 
 ---
 
@@ -318,5 +339,9 @@ Simulates IoT traffic sensors at intersections. The consumer writes live state b
 - **Edge geometry skipped** — keeps the model simple; add as WKT string later if spatial queries are needed
 - **Enrichment in Python** — `speed_kph` and `travel_time` computed before import; cheaper than post-load compute
 - **Advisories are synthetic** — no real data source required; realistic enough to demo GraphRAG spatial retrieval
+- **Embeddings via Ollama** — `nomic-embed-text` (768 dims) keeps everything local; no OpenAI key needed
+- **GDS path yield** — `nodes(path)` used instead of `gds.util.asNode()` — the latter is sandboxed by default in Neo4j Community
+- **Kafka KRaft mode** — `KAFKA_LISTENER_SECURITY_PROTOCOL_MAP` must explicitly map the `CONTROLLER` listener to `PLAINTEXT`; omitting it causes broker startup failure
+- **Consumer `auto_offset_reset=latest`** — start consumer before producer to avoid missing messages; use `earliest` if replaying history
 - **Kafka in KRaft mode** — no ZooKeeper dependency; single-node, single-partition, sufficient for local simulation
 - **Credentials in `.env`** — loaded via `python-dotenv`, never hardcoded
