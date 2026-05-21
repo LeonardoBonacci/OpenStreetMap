@@ -31,6 +31,13 @@ Relationship types
 
 :AFFECTS_ROAD  (:Advisory)-[:AFFECTS_ROAD]->(:Intersection)  (Phase 6)
 
+:HAD_READING  (:Intersection)-[:HAD_READING]->(:TrafficSnapshot)  (Phase 9)
+
+:TrafficSnapshot  (Phase 9)
+    speed        FLOAT     -- recorded speed in km/h
+    flow         INTEGER   -- vehicle count at time of reading
+    recorded_at  DATETIME  -- Neo4j native datetime of the reading
+
 Constraints & indexes
 ---------------------
 UNIQUE  Intersection.osmid          (also creates a b-tree lookup index)
@@ -39,6 +46,7 @@ RANGE   ROAD(highway)               (filter by road class)
 TEXT    ROAD(name)                  (substring / full-text search)
 UNIQUE  Advisory.id                 (Phase 6)
 VECTOR  Advisory(embedding)         (Phase 6 — 768 dims, cosine, nomic-embed-text)
+RANGE   TrafficSnapshot(recorded_at) (Phase 9 — temporal queries)
 """
 
 SCHEMA_STATEMENTS = [
@@ -67,6 +75,10 @@ SCHEMA_STATEMENTS = [
        FOR (a:Advisory) ON (a.embedding)
        OPTIONS {indexConfig: {`vector.dimensions`: 768,
                               `vector.similarity_function`: 'cosine'}}""",
+
+    # ---------- Phase 9: Temporal traffic snapshots ----------
+    """CREATE INDEX snapshot_recorded_at IF NOT EXISTS
+       FOR (s:TrafficSnapshot) ON (s.recorded_at)""",
 ]
 
 

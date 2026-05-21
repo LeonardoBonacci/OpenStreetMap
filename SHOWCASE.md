@@ -16,6 +16,7 @@ The project stitches together five concerns that any real urban-intelligence pla
 | **Contextual knowledge** | Advisory nodes + vector index | Human-authored disruption notices linked to the graph by topology |
 | **Natural language interface** | Ollama (llama3.1) + LangChain | Both Text→Cypher analytics and GraphRAG route Q&A |
 | **Structural analytics** | Neo4j GDS (Betweenness, PageRank) | Identifies critical bottleneck intersections in the network |
+| **Temporal memory** | Neo4j native datetime + :TrafficSnapshot | Time-series history enables rush-hour patterns and congestion duration |
 
 None of these is novel in isolation. The novelty is their **composition**: every query can simultaneously touch static geometry, live traffic state, and semantic advisory text, all within the same graph traversal.
 
@@ -65,13 +66,13 @@ load_advisories.py         ← Phase 6    kafka_producer.py   ← Phase 7
            │  :Advisory (+ 768-dim embedding vector)    │
            └───────────────────────────────────────────┘
                     │
-          ┌─────────┼──────────────────────┐
-          ▼         ▼                      ▼
-  text2cypher.py  graphrag_retriever.py  gds_analytics.py
-  Phase 5         Phase 6               Phase 8
-  NL → Cypher     Dijkstra route →      Betweenness Centrality
-  via llama3.1    advisory retrieval     + PageRank → criticality
-                  → LLM                  scores on :Intersection
+          ┌─────────┼──────────────────────────────────────┐
+          ▼         ▼                      ▼               ▼
+  text2cypher.py  graphrag_retriever.py  gds_analytics.py  traffic_history.py
+  Phase 5         Phase 6               Phase 8           Phase 9
+  NL → Cypher     Dijkstra route →      Betweenness       Rush-hour patterns
+  via llama3.1    advisory retrieval     Centrality +      chronic congestion
+                  → LLM                  PageRank          duration queries
 ```
 
 ---
@@ -211,6 +212,56 @@ ORDER BY avg_crit DESC
 
 This turns the graph from a passive topology store into an **active risk model**: you can now prioritise alerts and maintenance based on structural importance, not just current congestion.
 
+### Phase 9 — Temporal Traffic History (`src/traffic_history.py`)
+
+Previously every Kafka reading *overwrote* `current_speed` — the graph had no memory. Phase 9 adds a `:TrafficSnapshot` node for every reading, linked to its intersection:
+
+```
+(:Intersection)-[:HAD_READING]->(:TrafficSnapshot {
+    speed: 12.4, flow: 28,
+    recorded_at: datetime("2026-05-21T08:32:11Z")
+})
+```
+
+Neo4j's first-class `datetime` type and a range index on `recorded_at` make temporal queries efficient.
+
+Run it:
+```bash
+python src/traffic_history.py              # all summaries
+python src/traffic_history.py --morning    # 07:00–09:00 rush hour
+python src/traffic_history.py --evening    # 16:30–18:30 rush hour
+python src/traffic_history.py --chronic    # most-congested intersections
+python src/traffic_history.py --duration   # how long congestion persists
+```
+
+Key insight queries this enables:
+```cypher
+-- Morning rush-hour: slowest intersections
+MATCH (i:Intersection)-[:HAD_READING]->(s:TrafficSnapshot)
+WHERE time(s.recorded_at) >= time("07:00")
+  AND time(s.recorded_at) <  time("09:00")
+RETURN i.osmid, avg(s.speed) AS morning_avg
+ORDER BY morning_avg ASC LIMIT 10
+```
+
+```cypher
+-- Chronic congestion: intersections that are ALWAYS slow
+MATCH (i:Intersection)-[:HAD_READING]->(s:TrafficSnapshot)
+WHERE s.speed < 15
+RETURN i.osmid, count(s) AS congestion_events, avg(s.speed) AS avg_speed
+ORDER BY congestion_events DESC LIMIT 10
+```
+
+```cypher
+-- Combine temporal + structural: critical bottlenecks with chronic congestion
+MATCH (i:Intersection)-[:HAD_READING]->(s:TrafficSnapshot)
+WHERE s.speed < 15 AND i.criticality > 0.01
+RETURN i.osmid, i.criticality, count(s) AS events, avg(s.speed) AS avg_speed
+ORDER BY i.criticality DESC
+```
+
+This transforms the graph from a *current-state snapshot* into a **time-aware urban memory** — enabling pattern detection, anomaly baselines, and predictive queries with pure Cypher.
+
 ---
 
 ## Observing Live Changes in Neo4j
@@ -322,5 +373,5 @@ A city council, research lab, or startup can stand this up in an afternoon and i
 | Incident detection | Add a second consumer that writes `:Incident` nodes when thresholds are exceeded |
 | Route optimisation | ✅ Done — `gds_analytics.py` writes `criticality` + `pagerank` to every intersection |
 | Public alerts API | Expose the `traffic-alerts` Kafka topic via a WebSocket endpoint |
-| Historical replay | Persist consumer events to a time-series node `(:Reading {ts, speed, flow})-[:AT]->(:Intersection)` |
+| Historical replay | \u2705 Done — `kafka_consumer.py` writes `:TrafficSnapshot` nodes with native `datetime`; `traffic_history.py` analyses patterns |
 | Multi-modal transport | Add `:BusRoute`, `:TrainLine` nodes linked to `:Intersection` by proximity |

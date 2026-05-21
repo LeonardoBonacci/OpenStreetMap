@@ -65,6 +65,15 @@ SET i.current_flow  = $vehicle_count,
     i.last_seen     = $ts
 """
 
+_SNAPSHOT_CYPHER = """
+MATCH (i:Intersection {osmid: $osmid})
+CREATE (i)-[:HAD_READING]->(s:TrafficSnapshot {
+    speed:       $avg_speed_kph,
+    flow:        $vehicle_count,
+    recorded_at: datetime($ts)
+})
+"""
+
 _STREET_CYPHER = """
 MATCH (i:Intersection {osmid: $osmid})-[r:ROAD]-()
 WHERE r.name IS NOT NULL AND r.name <> ''
@@ -75,6 +84,13 @@ RETURN r.name AS name LIMIT 1
 def write_to_neo4j(session, msg: dict):
     session.run(
         _UPDATE_CYPHER,
+        osmid=msg["intersection_osmid"],
+        vehicle_count=msg["vehicle_count"],
+        avg_speed_kph=msg["avg_speed_kph"],
+        ts=msg["ts"],
+    )
+    session.run(
+        _SNAPSHOT_CYPHER,
         osmid=msg["intersection_osmid"],
         vehicle_count=msg["vehicle_count"],
         avg_speed_kph=msg["avg_speed_kph"],
